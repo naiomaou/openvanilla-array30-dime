@@ -1,0 +1,14 @@
+# 行列30 自建詞庫範本
+# 格式：字碼（半形空格）詞，一行一條，加在 %chardef begin 與 %chardef end 之間
+# 字碼限用行列三十鍵：a-z 與 ; , . /（避免使用數字），最長 32 鍵
+# 官方詞彙表可作為擴充基底：https://github.com/gontera/array30
+%ename array30-phrase
+%cname 行列30詞彙表
+%encoding utf-8
+%selkey 1234567890
+%keyname begin
+%keyname end
+%chardef begin
+xx 測試詞
+opl 範例詞
+%chardef end

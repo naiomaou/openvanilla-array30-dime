@@ -1,0 +1,310 @@
+diff --git a/Packages/OpenVanilla/Sources/OVIMArray/LegacyOVIMArray.cpp b/Packages/OpenVanilla/Sources/OVIMArray/LegacyOVIMArray.cpp
+index 2b1740e..0c35434 100644
+--- a/Packages/OpenVanilla/Sources/OVIMArray/LegacyOVIMArray.cpp
++++ b/Packages/OpenVanilla/Sources/OVIMArray/LegacyOVIMArray.cpp
+@@ -34,6 +34,8 @@
+ #include "OVLibrary.h"
+ #include "OVUtility.h"
+ #include <utility>
++#include <cstdlib>
++#include <sys/stat.h>
+ #ifdef OSX_INCLUDE
+         #include <Carbon/Carbon.h>
+ #endif
+@@ -44,6 +46,9 @@ using namespace OV_Array;
+ 
+ void OVIMArrayContext::clear()
+ {
++    // clear() is called at session start/stop (never mid-composition),
++    // which makes it a safe point to hot-reload the user phrase table.
++    parent->reloadUserPhraseTableIfNeeded();
+     keyseq.clear();
+     changeState(STATE_WAIT_KEY1);
+ }
+@@ -89,7 +94,7 @@ int OVIMArrayContext::WaitKey1(OVKeyCode* key, OVBuffer* buf,
+     }
+ 
+     if (!keyseq.hasWildcardCharacter()) {
+-        updateCandidate(tabs[SHORT_TAB], buf, candibar);
++        updateCandidateMerged(PHRASE_TAB, SHORT_TAB, buf, candibar);
+     }
+ 
+     char keycode = keyseq.getSeq()[0];
+@@ -121,7 +126,7 @@ int OVIMArrayContext::WaitKey2(OVKeyCode* key, OVBuffer* buf,
+     }
+     else {
+         if (!keyseq.hasWildcardCharacter()) {
+-            updateCandidate(tabs[SHORT_TAB], buf, candibar);
++            updateCandidateMerged(PHRASE_TAB, SHORT_TAB, buf, candibar);
+         }
+ 
+         if (isprint(keycode) && keyseq.valid(keycode)) {
+@@ -136,7 +141,7 @@ int OVIMArrayContext::WaitKey3(OVKeyCode* key, OVBuffer* buf,
+ {
+     if (keyseq.length() >= 3) {
+         if (!keyseq.hasWildcardCharacter()) {
+-            updateCandidate(tabs[MAIN_TAB], buf, candibar);
++            updateCandidateMerged(PHRASE_TAB, MAIN_TAB, buf, candibar);
+         }
+     }
+     return 1;    
+@@ -168,7 +173,10 @@ int OVIMArrayContext::WaitCandidate(OVKeyCode* key, OVBuffer* buf,
+     // enter == first candidate
+     // space (when candidate list has only one page) == first candidate
+     char c = key->code();
+-    bool notSelkey = selKeys.find(keycode) == string::npos;
++    // use the candidate list's *effective* selection keys, which may include
++    // the ' label for user phrases in addition to the digit keys
++    string effectiveSelKeys(candi.getSelKey());
++    bool notSelkey = effectiveSelKeys.find(keycode) == string::npos;
+ 
+     bool defaultSelKey = (keycode == ovkReturn || (candi.onePage() && keycode == ovkSpace));
+     murmur("notSelkey: %d", notSelkey);
+@@ -347,7 +355,7 @@ int OVIMArrayContext::keyEvent(OVKeyCode* key, OVBuffer* buf,
+             else {
+                 srv->beep();
+                 if (state <= STATE_WAIT_KEY3) { //dirty hack to set duty=1
+-                    updateCandidate(tabs[SHORT_TAB], buf, candi_bar);
++                    updateCandidateMerged(PHRASE_TAB, SHORT_TAB, buf, candi_bar);
+                 }
+             }
+         }
+@@ -371,14 +379,19 @@ int OVIMArrayContext::keyEvent(OVKeyCode* key, OVBuffer* buf,
+             changeState(STATE_WAIT_KEY1);
+             return 1;
+         }
+-        commitKeySeq(MAIN_TAB, "無此字", buf, candi_bar, srv);
++        // DIME-style: user phrases take precedence over the main table
++        commitKeySeqMerged(PHRASE_TAB, MAIN_TAB, "無此字", buf, candi_bar, srv);
+         return 1;
+     }
+ 
+     if (isprint(keycode) && validkey) {
+         if (keyseq.length() >= 5 ||
+            (keyseq.length() == 4 && keycode != 'i')) {
+-            return 1;
++            // allow sequences longer than the Array30 limit as long as
++            // they can still lead to a user phrase entry
++            if (!phrasePrefixExists(keycode)) {
++                return 1;
++            }
+         }
+         murmur("keyseq add [%c]", keycode);
+         keyseq.add(keycode);
+@@ -434,6 +447,116 @@ void OVIMArrayContext::commitKeySeq(int table, const char* errorMessage, OVBuffe
+     }
+ }
+ 
++// Merged candidate lookup: primary table (user phrases) results come first,
++// then the secondary table, with duplicates removed. This gives DIME-style
++// priority to user-defined phrases.
++int OVIMArrayContext::updateCandidateMerged(int primaryTable, int secondaryTable,
++                                            OVBuffer *buf, OVCandidate *candibar)
++{
++    candidateStringVector.clear();
++    string seq(keyseq.getSeq());
++
++    if (tabs[primaryTable]) {
++        auto primaryPairs = tabs[primaryTable]->findChardefWithWildcard(seq);
++        for (const auto& pair : primaryPairs) {
++            candidateStringVector.push_back(pair.second);
++        }
++    }
++
++    size_t phraseCount = candidateStringVector.size();
++
++    if (tabs[secondaryTable]) {
++        auto secondaryPairs = tabs[secondaryTable]->findChardefWithWildcard(seq);
++        for (const auto& pair : secondaryPairs) {
++            // NOTE: no deduplication here. Array tables use the placeholder
++            // character (⎔) to pin candidates to fixed positions so that
++            // digit-key selection matches the official Array30 layout.
++            // Removing "duplicates" would collapse those placeholders and
++            // shift every candidate's position.
++            candidateStringVector.push_back(pair.second);
++        }
++    }
++
++    if (candidateStringVector.size() == 0) {
++        clearCandidate(candibar);
++    }
++    else {
++        // DIME-style numbering: user phrases are shown first but labeled
++        // with ' instead of consuming the digit selection keys, so the
++        // original table candidates keep their official Array30 positions
++        // (pressing 7 still selects the table's 7th candidate). Space
++        // selects the first candidate, i.e. the user phrase when present.
++        string effectiveSelKeys(selKeys);
++        size_t room = 31 - selKeys.length(); // OVCandidateList selkey buffer is char[32]
++        if (phraseCount > 0 && phraseCount <= room) {
++            effectiveSelKeys = string(phraseCount, '\'') + selKeys;
++        }
++        candi.prepare(&candidateStringVector,
++                          const_cast<char*>(effectiveSelKeys.c_str()), candibar);
++    }
++    return 1;
++}
++
++void OVIMArrayContext::commitKeySeqMerged(int primaryTable, int secondaryTable,
++                                          const char* errorMessage, OVBuffer* buf,
++                                          OVCandidate* candi_bar, OVService* srv)
++{
++    if (keyseq.hasOnlyWildcardCharacter()) {
++        clearAll(buf, candi_bar);
++        changeState(STATE_WAIT_KEY1);
++        return;
++    }
++
++    updateCandidateMerged(primaryTable, secondaryTable, buf, candi_bar);
++
++    string c;
++    if (candidateStringVector.size() == 1) {
++        if (selectCandidate(0, c)) {
++            sendAndReset(c.c_str(), buf, candi_bar, srv);
++        }
++    }
++    else if (candidateStringVector.size() > 1) {
++        if (selectCandidate(0, c)) {
++            buf->clear()->append(c.c_str())->update();
++        }
++        changeState(STATE_WAIT_CANDIDATE);
++    } else {
++        clearAll(buf, candi_bar);
++        changeState(STATE_WAIT_KEY1);
++        srv->notify(errorMessage);
++    }
++}
++
++// Returns true if the current key sequence extended by nextKey is still a
++// prefix of at least one user phrase entry. Used to lift the 4-key limit
++// for user phrases with longer codes.
++bool OVIMArrayContext::phrasePrefixExists(char nextKey)
++{
++    if (!tabs[PHRASE_TAB]) {
++        return false;
++    }
++    if (keyseq.hasWildcardCharacter()) {
++        return false;
++    }
++
++    string prefix(keyseq.getSeq());
++    prefix.push_back((char)tolower(nextKey));
++
++    OpenVanilla::OVFastKeyValuePairMap* kvm = tabs[PHRASE_TAB]->chardefMap();
++    if (!kvm) {
++        return false;
++    }
++
++    for (size_t i = 0, len = kvm->size(); i < len; i++) {
++        const auto& kv = kvm->keyValuePairAtIndex(i);
++        if (kv.first.length() >= prefix.length() &&
++            kv.first.compare(0, prefix.length(), prefix) == 0) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ void OVIMArrayContext::dispatchStateHandler(OVKeyCode* key, OVBuffer* buf, 
+                                             OVCandidate* candi_bar, OVService* srv)
+ {
+@@ -509,10 +632,57 @@ int OVIMArray::initialize(OVDictionary *conf, OVService* s, const char *path)
+         murmur("OVIMArray: open cin %s", buf);
+         tabs[i] = parser.CINDataTableFromFileName(buf);
+     }
++
++    // DIME-style user phrase support: if the user maintains their own
++    // array-phrase.cin in Application Support, it overrides the bundled one
++    // and is hot-reloaded whenever its modification time changes.
++    userPhrasePath[0] = 0;
++    userPhraseMTime = 0;
++    const char* home = getenv("HOME");
++    if (home) {
++        snprintf(userPhrasePath, sizeof(userPhrasePath),
++                 "%s/Library/Application Support/OpenVanilla/UserData/Array/array-phrase.cin",
++                 home);
++        reloadUserPhraseTableIfNeeded();
++    }
++
+     updateConfig(conf);
+     return 1;
+ }
+ 
++void OVIMArray::reloadUserPhraseTableIfNeeded()
++{
++    if (!userPhrasePath[0]) {
++        return;
++    }
++
++    struct stat st;
++    if (stat(userPhrasePath, &st) != 0) {
++        // user file absent: keep whatever table is currently loaded
++        return;
++    }
++
++    if ((long)st.st_mtime == userPhraseMTime) {
++        return;
++    }
++
++    OpenVanilla::OVCINDataTableParser parser;
++    OpenVanilla::OVCINDataTable* newTable =
++        parser.CINDataTableFromFileName(string(userPhrasePath));
++    if (!newTable) {
++        // parse failure: keep the old table so typing keeps working
++        return;
++    }
++
++    OpenVanilla::OVCINDataTable* oldTable = tabs[OV_Array::PHRASE_TAB];
++    tabs[OV_Array::PHRASE_TAB] = newTable;
++    userPhraseMTime = (long)st.st_mtime;
++
++    if (oldTable) {
++        delete oldTable;
++    }
++}
++
+ int OVIMArray::updateConfig(OVDictionary *conf){
+     const char *AutoSP = "\xE7\x89\xB9\xE5\x88\xA5\xE7\xA2\xBC\xE6\x8F\x90\xE7\xA4\xBA";
+     const char *ForceSP = "\xE5\xBF\xAB\xE6\x89\x93\xE6\xA8\xA1\xE5\xBC\x8F";
+diff --git a/Packages/OpenVanilla/Sources/OVIMArray/include/LegacyOVIMArray.h b/Packages/OpenVanilla/Sources/OVIMArray/include/LegacyOVIMArray.h
+index 6f2e1f4..35c7be3 100644
+--- a/Packages/OpenVanilla/Sources/OVIMArray/include/LegacyOVIMArray.h
++++ b/Packages/OpenVanilla/Sources/OVIMArray/include/LegacyOVIMArray.h
+@@ -38,6 +38,7 @@
+ #include "ArrayKeySequence.h"
+ #include "OVCandidateList.h"
+ #include <cstring>
++#include <limits.h>
+ 
+ namespace OV_Array {
+     enum STATE {
+@@ -104,6 +105,11 @@ private:
+     }
+     void queryKeyName(const char *keys, std::string& outKeyNames);
+     void commitKeySeq(int table, const char* errorMessage, OVBuffer* buf, OVCandidate* candi_bar, OVService* srv);
++
++    // DIME-style user phrase support: merged lookup (user phrases first)
++    int updateCandidateMerged(int primaryTable, int secondaryTable, OVBuffer *buf, OVCandidate *candibar);
++    void commitKeySeqMerged(int primaryTable, int secondaryTable, const char* errorMessage, OVBuffer* buf, OVCandidate* candi_bar, OVService* srv);
++    bool phrasePrefixExists(char nextKey);
+ };
+ 
+ class OVIMArray : public OVInputMethod
+@@ -113,11 +119,17 @@ private:
+     OpenVanilla::OVCINDataTable *tabs[4]; // main, short-code, special-code, phrase
+     int cfgAutoSP, cfgForceSP;
+ 
++    // DIME-style user phrase support
++    char userPhrasePath[PATH_MAX];
++    long userPhraseMTime;
++
+ public:
+     virtual int initialize(OVDictionary *, OVService*, const char *mp);
+     virtual const char* identifier() { return "OVIMArray"; }
++    void reloadUserPhraseTableIfNeeded();
+     virtual OVInputMethodContext *newContext()
+ 	{ 
++        reloadUserPhraseTableIfNeeded();
+         return new OVIMArrayContext(this, tabs);
+     }
+     int updateConfig(OVDictionary *conf);
